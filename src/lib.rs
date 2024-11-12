@@ -2,10 +2,10 @@
     dead_code,
 )]
 
-use std::net::{UdpSocket, SocketAddr};
-use std::time::Duration;
+use std::net::TcpStream;
+use std::io::{Read, Write};
 use aes_gcm::aead::generic_array::{GenericArray, typenum::U12};
-use aes_gcm::{Aes256Gcm, Key, Nonce}; // Encryption for secure communication
+use aes_gcm::{Aes256Gcm, Key, Nonce};
 use aes_gcm::aead::Aead;
 use aes_gcm::KeyInit;
 use std::sync::Arc;
@@ -32,62 +32,50 @@ impl Payload {
     }
 
     fn get_nonce(nonce_precursor: u64) -> GenericArray<u8, U12> {
-        let mut nonce_precursor_bytes = [0u8; 12]; // Initialize a 12-byte array
+        let mut nonce_precursor_bytes = [0u8; 12];
         nonce_precursor_bytes[..8].copy_from_slice(&nonce_precursor.to_be_bytes());
         Nonce::from_slice(&nonce_precursor_bytes).to_owned()
     }
 }
 
-
 /// Custom protocol structure
-//#[derive(Debug)]
 struct CustomProtocol {
     latency_reduction: bool,
-    peer_addr: SocketAddr,
-    peer_socket: UdpSocket,
     encryption: Arc<Aes256Gcm>,
 }
 
 impl CustomProtocol {
-    // Constants for optimization and encryption setup    
     const BUFFER_SIZE: usize = 1024;
-    const ENCRYPTION_KEY: &[u8; 32] = b"exampleKey012345abcde012345abcde";  // NB: key length must be 32
+    const ENCRYPTION_KEY: &[u8; 32] = b"exampleKey012345abcde012345abcde";
 
     // Initialize protocol with optional latency reduction
-    fn new(peer_addr: &str, latency_reduction: bool) -> Self {
+    fn new(latency_reduction: bool) -> Self {
         let key: &Key<Aes256Gcm> = Key::<Aes256Gcm>::from_slice(Self::ENCRYPTION_KEY);
         let encryption = Aes256Gcm::new(key);
-        let peer_addr: SocketAddr = peer_addr.parse().expect("Invalid peer address");
-        let peer_socket = UdpSocket::bind(peer_addr).expect("Couldn't bind to address");
-        peer_socket.set_read_timeout(Some(Duration::from_secs(1))).expect("Failed to set timeout");
         CustomProtocol {
             latency_reduction,
-            peer_addr,
-            peer_socket,
             encryption: Arc::new(encryption),
         }
     }
 
-    // Method to send encrypted data, simulating lower latency and secure communication
-    fn send_data(&self, data: &[u8]) {
-        // Encrypt data for secure transfer
+    // Method to send encrypted data over TCP
+    fn send_data(&self, stream: &mut TcpStream, data: &[u8]) {
         let payload = Payload::from(data, self);
         let serialized_payload = bincode::serialize(&payload).expect("Failed to serialize message");
 
         if self.latency_reduction {
-            // Mock latency reduction optimization (e.g., reduced retransmission, batch sending)
-            self.peer_socket.send_to(&serialized_payload, self.peer_addr).expect("Failed to send data");
+            // Mock latency reduction (e.g., batch sending)
+            stream.write_all(&serialized_payload).expect("Failed to send data");
         } else {
-            // Standard transmission for comparison
-            self.peer_socket.send_to(&serialized_payload, self.peer_addr).expect("Failed to send data");
+            stream.write_all(&serialized_payload).expect("Failed to send data");
         }
     }
 
-    // Method to receive data
-    fn receive_data(&self) -> Vec<u8> {
+    // Method to receive data over TCP
+    fn receive_data(&self, stream: &mut TcpStream) -> Vec<u8> {
         let mut buffer = [0; Self::BUFFER_SIZE];
-        let (amt, _src) = self.peer_socket.recv_from(&mut buffer).expect("Failed to receive data");
-        let payload:Payload = bincode::deserialize(&buffer[..amt]).unwrap();
+        let amt = stream.read(&mut buffer).expect("Failed to receive data");
+        let payload: Payload = bincode::deserialize(&buffer[..amt]).expect("Failed to deserialize message");
         let nonce = Payload::get_nonce(payload.nonce_precursor);
         self.encryption.decrypt(&nonce, &payload.encrypted_data[..]).expect("Decryption failed")
     }
@@ -96,13 +84,30 @@ impl CustomProtocol {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::thread;
+    use std::net::TcpListener;
 
     #[test]
-    fn basic_test() {
-        let protocol = CustomProtocol::new("127.0.0.1:8082", true);
-        let data = "Hello, secure peer-to-peer world!";
-        protocol.send_data(data.as_bytes());
-        let received_data = protocol.receive_data();
-        assert_eq!(data, std::str::from_utf8(&received_data).unwrap());
+    fn tcp_test() {
+        // Create a listener in a separate thread to simulate server behavior
+        let listener_thread = thread::spawn(|| {
+            let listener = TcpListener::bind("127.0.0.1:8082").expect("Could not bind");
+            let (mut stream, _addr) = listener.accept().expect("Failed to accept connection");
+
+            let protocol = CustomProtocol::new(true);
+            let received_data = protocol.receive_data(&mut stream);
+            assert_eq!("Hello, secure peer-to-peer world!", std::str::from_utf8(&received_data).unwrap());
+        });
+
+        // Create a client to simulate sending data
+        let client_thread = thread::spawn(|| {
+            let mut stream = TcpStream::connect("127.0.0.1:8082").expect("Failed to connect");
+            let protocol = CustomProtocol::new(true);
+            let data = "Hello, secure peer-to-peer world!";
+            protocol.send_data(&mut stream, data.as_bytes());
+        });
+
+        listener_thread.join().expect("Listener thread failed");
+        client_thread.join().expect("Client thread failed");
     }
 }
