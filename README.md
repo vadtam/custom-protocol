@@ -2,4 +2,5 @@
 ## How to run
 $ cargo test
 ## Features
-- use of nonce
+- Dynamic Nonce Handling
+- Asynchronous Networking with tokio
