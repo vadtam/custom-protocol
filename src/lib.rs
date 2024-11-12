@@ -1,16 +1,16 @@
-#![allow(
-    dead_code,
-)]
+#![allow(dead_code)]
 
 use tokio::net::TcpStream;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use aes_gcm::aead::generic_array::{GenericArray, typenum::U12};
 use aes_gcm::{Aes256Gcm, Key, Nonce};
-use aes_gcm::aead::Aead;
+use aes_gcm::aead::{Aead, Error as AeadError};
 use aes_gcm::KeyInit;
 use std::sync::Arc;
 use serde::{Serialize, Deserialize};
 use rand::Rng;
+use thiserror::Error;
+use log::{error, info};
 
 #[derive(Serialize, Deserialize)]
 struct Payload {
@@ -19,15 +19,16 @@ struct Payload {
 }
 
 impl Payload {
-    fn from(data: &[u8], protocol: &CustomProtocol) -> Payload {
+    fn from(data: &[u8], protocol: &CustomProtocol) -> Result<Payload, CustomProtocolError> {
         let mut rng = rand::thread_rng();
         let nonce_precursor = rng.gen::<u64>();
         let nonce = Payload::get_nonce(nonce_precursor);
-        let encrypted_data = protocol.encryption.encrypt(&nonce, data).expect("Encryption failed");
-        Payload {
+        let encrypted_data = protocol.encryption.encrypt(&nonce, data)
+            .map_err(CustomProtocolError::EncryptionFailed)?;
+        Ok(Payload {
             nonce_precursor,
             encrypted_data,
-        }
+        })
     }
 
     fn get_nonce(nonce_precursor: u64) -> GenericArray<u8, U12> {
@@ -35,6 +36,16 @@ impl Payload {
         nonce_precursor_bytes[..8].copy_from_slice(&nonce_precursor.to_be_bytes());
         Nonce::from_slice(&nonce_precursor_bytes).to_owned()
     }
+}
+
+#[derive(Error, Debug)]
+enum CustomProtocolError {
+    #[error("Encryption failed: {0}")]
+    EncryptionFailed(AeadError),
+    #[error("I/O error occurred: {0}")]
+    IoError(#[from] std::io::Error),
+    #[error("Serialization error: {0}")]
+    SerializationError(#[from] bincode::Error),
 }
 
 /// Custom protocol structure
@@ -58,25 +69,30 @@ impl CustomProtocol {
     }
 
     // Asynchronous method to send encrypted data over TCP
-    async fn send_data(&self, stream: &mut TcpStream, data: &[u8]) {
-        let payload = Payload::from(data, self);
-        let serialized_payload = bincode::serialize(&payload).expect("Failed to serialize message");
+    async fn send_data(&self, stream: &mut TcpStream, data: &[u8]) -> Result<(), CustomProtocolError> {
+        let payload = Payload::from(data, self)?;
+        let serialized_payload = bincode::serialize(&payload)?;
 
         if self.latency_reduction {
-            // Mock latency reduction (e.g., batch sending)
-            stream.write_all(&serialized_payload).await.expect("Failed to send data");
+            info!("Sending data with latency reduction.");
+            stream.write_all(&serialized_payload).await?;
         } else {
-            stream.write_all(&serialized_payload).await.expect("Failed to send data");
+            info!("Sending data without latency reduction.");
+            stream.write_all(&serialized_payload).await?;
         }
+
+        Ok(())
     }
 
     // Asynchronous method to receive data over TCP
-    async fn receive_data(&self, stream: &mut TcpStream) -> Vec<u8> {
+    async fn receive_data(&self, stream: &mut TcpStream) -> Result<Vec<u8>, CustomProtocolError> {
         let mut buffer = [0; Self::BUFFER_SIZE];
-        let amt = stream.read(&mut buffer).await.expect("Failed to receive data");
-        let payload: Payload = bincode::deserialize(&buffer[..amt]).expect("Failed to deserialize message");
+        let amt = stream.read(&mut buffer).await?;
+        let payload: Payload = bincode::deserialize(&buffer[..amt])?;
         let nonce = Payload::get_nonce(payload.nonce_precursor);
-        self.encryption.decrypt(&nonce, &payload.encrypted_data[..]).expect("Decryption failed")
+        let decrypted_data = self.encryption.decrypt(&nonce, &*payload.encrypted_data)
+            .map_err(CustomProtocolError::EncryptionFailed)?;
+        Ok(decrypted_data)
     }
 }
 
@@ -88,14 +104,21 @@ mod tests {
     
     #[tokio::test]
     async fn tcp_test() {
+        // Initialize logging for testing
+        env_logger::init();
+
         // Spawn a listener task to simulate server behavior
         let listener_task = task::spawn(async {
             let listener = TcpListener::bind("127.0.0.1:8082").await.expect("Could not bind");
             let (mut stream, _addr) = listener.accept().await.expect("Failed to accept connection");
 
             let protocol = CustomProtocol::new(true);
-            let received_data = protocol.receive_data(&mut stream).await;
-            assert_eq!("Hello, secure peer-to-peer world!", std::str::from_utf8(&received_data).unwrap());
+            match protocol.receive_data(&mut stream).await {
+                Ok(received_data) => {
+                    assert_eq!("Hello, secure peer-to-peer world!", std::str::from_utf8(&received_data).unwrap());
+                },
+                Err(e) => error!("Failed to receive data: {}", e),
+            }
         });
 
         // Spawn a client task to simulate sending data
@@ -103,11 +126,12 @@ mod tests {
             let mut stream = TcpStream::connect("127.0.0.1:8082").await.expect("Failed to connect");
             let protocol = CustomProtocol::new(true);
             let data = "Hello, secure peer-to-peer world!";
-            protocol.send_data(&mut stream, data.as_bytes()).await;
+            if let Err(e) = protocol.send_data(&mut stream, data.as_bytes()).await {
+                error!("Failed to send data: {}", e);
+            }
         });
 
-        // Await both tasks to complete
-        let _ = tokio::join!(listener_task, client_task);
+        let tasks = [client_task, listener_task];
+        let _ = futures::future::join_all(tasks).await;
     }
 }
-
