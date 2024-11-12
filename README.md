@@ -1,0 +1,2 @@
+# Custom Protocol
+$ cargo test

@@ -1,0 +1,7 @@
+[package]
+name = "custom-protocol"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+aes-gcm = "0.10.3"  # Encryption
