@@ -1,17 +1,45 @@
 #![allow(
     dead_code,
-    // unused_variables,
 )]
 
 use std::net::{UdpSocket, SocketAddr};
-use std::time::{Instant, Duration};
+use std::time::Duration;
+use aes_gcm::aead::generic_array::{GenericArray, typenum::U12};
 use aes_gcm::{Aes256Gcm, Key, Nonce}; // Encryption for secure communication
 use aes_gcm::aead::Aead;
 use aes_gcm::KeyInit;
 use std::sync::Arc;
+use serde::{Serialize, Deserialize};
+use rand::Rng;
 
 
-// Custom protocol structure
+#[derive(Serialize, Deserialize)]
+struct Payload {
+    nonce_precursor: u64,
+    encrypted_data: Vec<u8>, // bytes
+}
+
+impl Payload {
+    fn from(data: &[u8], protocol: &CustomProtocol) -> Payload {
+        let mut rng = rand::thread_rng();
+        let nonce_precursor = rng.gen::<u64>();
+        let nonce = Payload::get_nonce(nonce_precursor);
+        let encrypted_data = protocol.encryption.encrypt(&nonce, data).expect("Encryption failed");
+        Payload {
+            nonce_precursor,
+            encrypted_data,
+        }
+    }
+
+    fn get_nonce(nonce_precursor: u64) -> GenericArray<u8, U12> {
+        let mut nonce_precursor_bytes = [0u8; 12]; // Initialize a 12-byte array
+        nonce_precursor_bytes[..8].copy_from_slice(&nonce_precursor.to_be_bytes());
+        Nonce::from_slice(&nonce_precursor_bytes).to_owned()
+    }
+}
+
+
+/// Custom protocol structure
 //#[derive(Debug)]
 struct CustomProtocol {
     latency_reduction: bool,
@@ -42,32 +70,26 @@ impl CustomProtocol {
 
     // Method to send encrypted data, simulating lower latency and secure communication
     fn send_data(&self, data: &[u8]) {
-        let start = Instant::now();
-
         // Encrypt data for secure transfer
-        let nonce = Nonce::from_slice(b"unique_nonce"); // In production, use unique nonce per message
-        let encrypted_data = self.encryption.encrypt(nonce, data).expect("Encryption failed");
+        let payload = Payload::from(data, self);
+        let serialized_payload = bincode::serialize(&payload).expect("Failed to serialize message");
 
         if self.latency_reduction {
             // Mock latency reduction optimization (e.g., reduced retransmission, batch sending)
-            self.peer_socket.send_to(&encrypted_data, self.peer_addr).expect("Failed to send data");
+            self.peer_socket.send_to(&serialized_payload, self.peer_addr).expect("Failed to send data");
         } else {
             // Standard transmission for comparison
-            self.peer_socket.send_to(data, self.peer_addr).expect("Failed to send data");
+            self.peer_socket.send_to(&serialized_payload, self.peer_addr).expect("Failed to send data");
         }
-
-        let duration = Instant::now() - start;
-        println!("Data sent in {:?} with {} encryption", duration, if self.latency_reduction { "optimized" } else { "standard" });
     }
 
     // Method to receive data
     fn receive_data(&self) -> Vec<u8> {
         let mut buffer = [0; Self::BUFFER_SIZE];
         let (amt, _src) = self.peer_socket.recv_from(&mut buffer).expect("Failed to receive data");
-
-        // Decrypt data
-        let nonce = Nonce::from_slice(b"unique_nonce"); // Match nonce used during encryption
-        self.encryption.decrypt(nonce, &buffer[..amt]).expect("Decryption failed")
+        let payload:Payload = bincode::deserialize(&buffer[..amt]).unwrap();
+        let nonce = Payload::get_nonce(payload.nonce_precursor);
+        self.encryption.decrypt(&nonce, &payload.encrypted_data[..]).expect("Decryption failed")
     }
 }
 
@@ -76,7 +98,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn it_works() {
+    fn basic_test() {
         let protocol = CustomProtocol::new("127.0.0.1:8082", true);
         let data = "Hello, secure peer-to-peer world!";
         protocol.send_data(data.as_bytes());
