@@ -74,9 +74,17 @@ impl Payload {
             encryption: &Arc<Aes256Gcm>, packet_id: u64) -> Result<Payload, CustomProtocolError> {
         let nonce_precursor = protocol.nonce_counter.fetch_add(1, Ordering::Relaxed);
         let nonce = Payload::get_nonce(nonce_precursor);
-        let data = bincode::serialize(data).unwrap();
-        let encrypted_data = encryption.encrypt(&nonce, &*data)
-            .map_err(CustomProtocolError::EncryptionFailed)?;
+        let serialized_data = bincode::serialize(data)
+            .map_err(|e| CustomProtocolError::SerializationError {
+                context: "PayloadData serialization",
+                source: e,
+            })?;
+        
+        let encrypted_data = encryption.encrypt(&nonce, &*serialized_data)
+            .map_err(|_e| CustomProtocolError::EncryptionFailed {
+                packet_id,
+            })?;
+        
         Ok(Payload {
             version: Payload::CURRENT_VERSION,
             nonce_precursor,
@@ -94,14 +102,56 @@ impl Payload {
 
 #[derive(Error, Debug)]
 enum CustomProtocolError {
-    #[error("Encryption failed: {0}")]
-    EncryptionFailed(AeadError),
-    #[error("I/O error occurred: {0}")]
-    IoError(#[from] std::io::Error),
-    #[error("Serialization error: {0}")]
-    SerializationError(#[from] bincode::Error),
-    #[error("Handshake error")]
-    HandshakeError,
+    #[error("Encryption failed for packet ID {packet_id}")]
+    EncryptionFailed {
+        packet_id: u64,
+    },
+    #[error("Decryption failed for packet ID {packet_id}")]
+    DecryptionFailed {
+        packet_id: u64,
+    },
+    #[error("I/O error occurred during {operation}: {source}")]
+    IoError {
+        operation: &'static str,
+        source: std::io::Error,
+    },
+    #[error("Serialization error in {context}: {source}")]
+    SerializationError {
+        context: &'static str,
+        source: bincode::Error,
+    },
+    #[error("Handshake error: {0}")]
+    HandshakeError(String),
+    #[error("Timeout occurred while retransmitting packet ID {packet_id}")]
+    RetransmissionTimeout {
+        packet_id: u64,
+    },
+}
+
+impl From<AeadError> for CustomProtocolError {
+    fn from(_err: AeadError) -> Self {
+        CustomProtocolError::EncryptionFailed {
+            packet_id: 0, // Replace with actual packet ID if available
+        }
+    }
+}
+
+impl From<std::io::Error> for CustomProtocolError {
+    fn from(error: std::io::Error) -> Self {
+        CustomProtocolError::IoError {
+            operation: "TCP operation",
+            source: error,
+        }
+    }
+}
+
+impl From<bincode::Error> for CustomProtocolError {
+    fn from(error: bincode::Error) -> Self {
+        CustomProtocolError::SerializationError {
+            context: "general serialization/deserialization",
+            source: error,
+        }
+    }
 }
 
 /// Custom protocol structure
@@ -153,48 +203,60 @@ impl CustomProtocol {
 
     // Asynchronous method to send encrypted data over TCP
     async fn send_data(&self, stream: &mut TcpStream, data: &PayloadData) -> Result<(), CustomProtocolError> {
-        let encryption = CustomProtocol::handshake(stream).await.unwrap();
+        let encryption = CustomProtocol::handshake(stream).await?;
         let packet_id = self.packet_id_counter.fetch_add(1, Ordering::Relaxed);
         let payload = Payload::from(data, self, &encryption, packet_id)?;
-        let serialized_payload = bincode::serialize(&payload)?;
+        let serialized_payload = bincode::serialize(&payload)
+            .map_err(|e| CustomProtocolError::SerializationError {
+                context: "Payload serialization",
+                source: e,
+            })?;
 
-        // Track unacknowledged packets
         let timestamp = Instant::now();
         self.unacknowledged_packets.lock().await.push_back((packet_id, serialized_payload.clone(), timestamp));
 
-        if self.latency_reduction {
+        let send_result = if self.latency_reduction {
             info!("Sending data with latency reduction.");
-            stream.write_all(&serialized_payload).await?;
+            stream.write_all(&serialized_payload).await
         } else {
             info!("Sending data without latency reduction.");
-            stream.write_all(&serialized_payload).await?;
-        }
+            stream.write_all(&serialized_payload).await
+        };
 
-        Ok(())
+        send_result.map_err(|e| CustomProtocolError::IoError {
+            operation: "send data over TCP",
+            source: e,
+        })
     }
 
     // Asynchronous method to receive data over TCP
     async fn receive_data(&self, stream: &mut TcpStream) -> Result<PayloadData, CustomProtocolError> {
-        let encryption = CustomProtocol::handshake(stream).await.unwrap();
+        let encryption = CustomProtocol::handshake(stream).await?;
         let mut buffer = [0; Self::BUFFER_SIZE];
-        let amt = stream.read(&mut buffer).await?;
-        let payload: Payload = bincode::deserialize(&buffer[..amt])?;
+        let amt = stream.read(&mut buffer).await
+            .map_err(|e| CustomProtocolError::IoError {
+                operation: "receive data over TCP",
+                source: e,
+            })?;
+        
+        let payload: Payload = bincode::deserialize(&buffer[..amt])
+            .map_err(|e| CustomProtocolError::SerializationError {
+                context: "Payload deserialization",
+                source: e,
+            })?;
+        
         let nonce = Payload::get_nonce(payload.nonce_precursor);
         let decrypted_data = encryption.decrypt(&nonce, &*payload.encrypted_data)
-            .map_err(CustomProtocolError::EncryptionFailed)?;
-        let data: PayloadData = bincode::deserialize(&decrypted_data[..])?;
-        match data.payload_data_type {
-            PayloadDataType::ACK => {
-                let ack_packet_id: u64 = bincode::deserialize(&data.decrypted_data[..]).unwrap();
-                self.handle_ack(ack_packet_id).await;
-            },
-            PayloadDataType::DATA => {
-                // Send ACK
-                let ack_payload = bincode::serialize(&payload.packet_id)?;
-                stream.write_all(&ack_payload).await?;
-            }
-        }
-
+            .map_err(|_e| CustomProtocolError::DecryptionFailed {
+                packet_id: payload.packet_id,
+            })?;
+        
+        let data: PayloadData = bincode::deserialize(&decrypted_data[..])
+            .map_err(|e| CustomProtocolError::SerializationError {
+                context: "PayloadData deserialization",
+                source: e,
+            })?;
+        
         Ok(data)
     }
 
