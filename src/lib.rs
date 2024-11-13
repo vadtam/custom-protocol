@@ -8,7 +8,6 @@ use aes_gcm::{Aes256Gcm, Key, Nonce};
 use aes_gcm::aead::{Aead, Error as AeadError};
 use aes_gcm::KeyInit;
 use std::sync::Arc;
-use std::thread::JoinHandle;
 use serde::{Serialize, Deserialize};
 use rand::Rng;
 use thiserror::Error;
