@@ -14,6 +14,7 @@ use log::{error, info};
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 use std::sync::atomic::{AtomicU64, Ordering};
+use x25519_dalek::{EphemeralSecret, PublicKey as DhPublicKey};
 
 struct LatencyTracker {
     latencies: VecDeque<Duration>,
@@ -55,10 +56,10 @@ struct Payload {
 impl Payload {
     const CURRENT_VERSION: u8 = 1;
 
-    fn from(data: &[u8], protocol: &CustomProtocol) -> Result<Payload, CustomProtocolError> {
+    fn from(data: &[u8], protocol: &CustomProtocol, encryption: &Arc<Aes256Gcm>) -> Result<Payload, CustomProtocolError> {
         let nonce_precursor = protocol.nonce_counter.fetch_add(1, Ordering::Relaxed);
         let nonce = Payload::get_nonce(nonce_precursor);
-        let encrypted_data = protocol.encryption.encrypt(&nonce, data)
+        let encrypted_data = encryption.encrypt(&nonce, data)
             .map_err(CustomProtocolError::EncryptionFailed)?;
         Ok(Payload {
             version: Payload::CURRENT_VERSION,
@@ -82,35 +83,60 @@ enum CustomProtocolError {
     IoError(#[from] std::io::Error),
     #[error("Serialization error: {0}")]
     SerializationError(#[from] bincode::Error),
+    #[error("Handshake error")]
+    HandshakeError,
 }
 
 /// Custom protocol structure
 struct CustomProtocol {
     nonce_counter: AtomicU64,
     latency_reduction: bool,
-    encryption: Arc<Aes256Gcm>,
+    // encryption: Arc<Aes256Gcm>,
 }
 
 impl CustomProtocol {
     const BUFFER_SIZE: usize = 1024;
-    const ENCRYPTION_KEY: &[u8; 32] = b"exampleKey012345abcde012345abcde";
+    //const ENCRYPTION_KEY: &[u8; 32] = b"exampleKey012345abcde012345abcde";
 
     // Initialize protocol with optional latency reduction
     fn new(latency_reduction: bool) -> Self {
-        let key: &Key<Aes256Gcm> = Key::<Aes256Gcm>::from_slice(Self::ENCRYPTION_KEY);
-        let encryption = Aes256Gcm::new(key);
+        //let key: &Key<Aes256Gcm> = Key::<Aes256Gcm>::from_slice(Self::ENCRYPTION_KEY);
+        //let encryption = Aes256Gcm::new(key);
         let mut rng = rand::thread_rng();
         let nonce_counter_start_value = rng.gen::<u64>();
         CustomProtocol {
             nonce_counter: AtomicU64::new(nonce_counter_start_value),
             latency_reduction,
-            encryption: Arc::new(encryption),
+           // encryption: Arc::new(encryption),
         }
+    }
+
+    async fn handshake(stream: &mut TcpStream) -> Result<Arc<Aes256Gcm>, CustomProtocolError> {
+        // Generate ephemeral DH key pair
+        let rng = rand::thread_rng();
+        let private_key = EphemeralSecret::random_from_rng(rng);
+        let public_key = DhPublicKey::from(&private_key);
+
+        // Send public key to the peer
+        stream.write_all(public_key.as_bytes()).await?;
+
+        // Receive peer's public key
+        let mut peer_public_key_bytes = [0u8; 32];
+        stream.read_exact(&mut peer_public_key_bytes).await?;
+        let peer_public_key = DhPublicKey::from(peer_public_key_bytes);
+
+        // Calculate shared secret
+        let shared_secret = private_key.diffie_hellman(&peer_public_key);
+        let session_key = Key::<Aes256Gcm>::from_slice(&shared_secret.as_bytes()[..32]);
+        let encryption = Aes256Gcm::new(session_key);
+
+        Ok(Arc::new(encryption))
     }
 
     // Asynchronous method to send encrypted data over TCP
     async fn send_data(&self, stream: &mut TcpStream, data: &[u8]) -> Result<(), CustomProtocolError> {
-        let payload = Payload::from(data, self)?;
+        let encryption = CustomProtocol::handshake(stream).await.unwrap();
+        let payload = Payload::from(data, self, &encryption)?;
         let serialized_payload = bincode::serialize(&payload)?;
 
         if self.latency_reduction {
@@ -126,11 +152,12 @@ impl CustomProtocol {
 
     // Asynchronous method to receive data over TCP
     async fn receive_data(&self, stream: &mut TcpStream) -> Result<Vec<u8>, CustomProtocolError> {
+        let encryption = CustomProtocol::handshake(stream).await.unwrap();
         let mut buffer = [0; Self::BUFFER_SIZE];
         let amt = stream.read(&mut buffer).await?;
         let payload: Payload = bincode::deserialize(&buffer[..amt])?;
         let nonce = Payload::get_nonce(payload.nonce_precursor);
-        let decrypted_data = self.encryption.decrypt(&nonce, &*payload.encrypted_data)
+        let decrypted_data = encryption.decrypt(&nonce, &*payload.encrypted_data)
             .map_err(CustomProtocolError::EncryptionFailed)?;
         Ok(decrypted_data)
     }
