@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 
+use tokio::sync::Mutex;
 use tokio::net::TcpStream;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use aes_gcm::aead::generic_array::{GenericArray, typenum::U12};
@@ -45,25 +46,41 @@ impl LatencyTracker {
     }
 }
 
+#[derive(Serialize, Deserialize)]
+struct  PayloadData {
+    payload_data_type: PayloadDataType,
+    decrypted_data: Vec<u8>, // Bytes
+}
+
+#[derive(Serialize, Deserialize)]
+enum PayloadDataType {
+    ACK,
+    DATA,
+}
+
 
 #[derive(Serialize, Deserialize)]
 struct Payload {
     version: u8,
     nonce_precursor: u64,
-    encrypted_data: Vec<u8>, // bytes
+    packet_id: u64, // Unique packet ID for acknowledgment
+    encrypted_data: Vec<u8>, // Bytes
 }
 
 impl Payload {
     const CURRENT_VERSION: u8 = 1;
 
-    fn from(data: &[u8], protocol: &CustomProtocol, encryption: &Arc<Aes256Gcm>) -> Result<Payload, CustomProtocolError> {
+    fn from(data: &PayloadData, protocol: &CustomProtocol,
+            encryption: &Arc<Aes256Gcm>, packet_id: u64) -> Result<Payload, CustomProtocolError> {
         let nonce_precursor = protocol.nonce_counter.fetch_add(1, Ordering::Relaxed);
         let nonce = Payload::get_nonce(nonce_precursor);
-        let encrypted_data = encryption.encrypt(&nonce, data)
+        let data = bincode::serialize(data).unwrap();
+        let encrypted_data = encryption.encrypt(&nonce, &*data)
             .map_err(CustomProtocolError::EncryptionFailed)?;
         Ok(Payload {
             version: Payload::CURRENT_VERSION,
             nonce_precursor,
+            packet_id,
             encrypted_data,
         })
     }
@@ -91,23 +108,24 @@ enum CustomProtocolError {
 struct CustomProtocol {
     nonce_counter: AtomicU64,
     latency_reduction: bool,
-    // encryption: Arc<Aes256Gcm>,
+    packet_id_counter: AtomicU64,
+    unacknowledged_packets: Arc<Mutex<VecDeque<(u64, Vec<u8>, Instant)>>>, // Stores packet_id, data, and timestamp
+    retransmit_unacknowledged: bool,
 }
 
 impl CustomProtocol {
     const BUFFER_SIZE: usize = 1024;
-    //const ENCRYPTION_KEY: &[u8; 32] = b"exampleKey012345abcde012345abcde";
 
     // Initialize protocol with optional latency reduction
     fn new(latency_reduction: bool) -> Self {
-        //let key: &Key<Aes256Gcm> = Key::<Aes256Gcm>::from_slice(Self::ENCRYPTION_KEY);
-        //let encryption = Aes256Gcm::new(key);
         let mut rng = rand::thread_rng();
         let nonce_counter_start_value = rng.gen::<u64>();
         CustomProtocol {
             nonce_counter: AtomicU64::new(nonce_counter_start_value),
             latency_reduction,
-           // encryption: Arc::new(encryption),
+            packet_id_counter: AtomicU64::new(0),
+            unacknowledged_packets: Arc::new(Mutex::new(VecDeque::new())),
+            retransmit_unacknowledged: true,
         }
     }
 
@@ -134,10 +152,15 @@ impl CustomProtocol {
     }
 
     // Asynchronous method to send encrypted data over TCP
-    async fn send_data(&self, stream: &mut TcpStream, data: &[u8]) -> Result<(), CustomProtocolError> {
+    async fn send_data(&self, stream: &mut TcpStream, data: &PayloadData) -> Result<(), CustomProtocolError> {
         let encryption = CustomProtocol::handshake(stream).await.unwrap();
-        let payload = Payload::from(data, self, &encryption)?;
+        let packet_id = self.packet_id_counter.fetch_add(1, Ordering::Relaxed);
+        let payload = Payload::from(data, self, &encryption, packet_id)?;
         let serialized_payload = bincode::serialize(&payload)?;
+
+        // Track unacknowledged packets
+        let timestamp = Instant::now();
+        self.unacknowledged_packets.lock().await.push_back((packet_id, serialized_payload.clone(), timestamp));
 
         if self.latency_reduction {
             info!("Sending data with latency reduction.");
@@ -151,7 +174,7 @@ impl CustomProtocol {
     }
 
     // Asynchronous method to receive data over TCP
-    async fn receive_data(&self, stream: &mut TcpStream) -> Result<Vec<u8>, CustomProtocolError> {
+    async fn receive_data(&self, stream: &mut TcpStream) -> Result<PayloadData, CustomProtocolError> {
         let encryption = CustomProtocol::handshake(stream).await.unwrap();
         let mut buffer = [0; Self::BUFFER_SIZE];
         let amt = stream.read(&mut buffer).await?;
@@ -159,10 +182,28 @@ impl CustomProtocol {
         let nonce = Payload::get_nonce(payload.nonce_precursor);
         let decrypted_data = encryption.decrypt(&nonce, &*payload.encrypted_data)
             .map_err(CustomProtocolError::EncryptionFailed)?;
-        Ok(decrypted_data)
+        let data: PayloadData = bincode::deserialize(&decrypted_data[..])?;
+        match data.payload_data_type {
+            PayloadDataType::ACK => {
+                let ack_packet_id: u64 = bincode::deserialize(&data.decrypted_data[..]).unwrap();
+                self.handle_ack(ack_packet_id).await;
+            },
+            PayloadDataType::DATA => {
+                // Send ACK
+                let ack_payload = bincode::serialize(&payload.packet_id)?;
+                stream.write_all(&ack_payload).await?;
+            }
+        }
+
+        Ok(data)
     }
 
-    async fn send_data_with_latency(&self, stream: &mut TcpStream, data: &[u8], tracker: &mut LatencyTracker) -> Result<(), CustomProtocolError> {
+    async fn handle_ack(&self, ack_packet_id: u64) {
+        let mut unacked_packets = self.unacknowledged_packets.lock().await;
+        unacked_packets.retain(|(packet_id, _, _)| *packet_id != ack_packet_id);
+    }
+
+    async fn send_data_with_latency(&self, stream: &mut TcpStream, data: &PayloadData, tracker: &mut LatencyTracker) -> Result<(), CustomProtocolError> {
         let start_time = Instant::now();
         self.send_data(stream, data).await?;
         let elapsed_time = start_time.elapsed();
@@ -176,6 +217,26 @@ impl CustomProtocol {
             0.0
         } else {
             (sent_packets - acked_packets) as f64 / sent_packets as f64 * 100.0
+        }
+    }
+
+    async fn retransmit_unacknowledged(&self, stream: &mut TcpStream, timeout: Duration) -> Result<(), CustomProtocolError> {
+        loop {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let mut unacked_packets = self.unacknowledged_packets.lock().await;
+            let now = Instant::now();
+    
+            for (packet_id, data, timestamp) in unacked_packets.iter_mut() {
+                if now.duration_since(*timestamp) > timeout {
+                    info!("Retransmitting packet with ID {}", packet_id);
+                    stream.write_all(data).await?;
+                    *timestamp = now;
+                }
+            }
+            if !self.retransmit_unacknowledged {
+                info!("Retransmitting loop exited.");
+                return Ok(());
+            }
         }
     }
 }
@@ -199,7 +260,7 @@ mod tests {
             let protocol = CustomProtocol::new(true);
             match protocol.receive_data(&mut stream).await {
                 Ok(received_data) => {
-                    assert_eq!("Hello, secure peer-to-peer world!", std::str::from_utf8(&received_data).unwrap());
+                    assert_eq!("Hello, secure peer-to-peer world!", std::str::from_utf8(&received_data.decrypted_data).unwrap());
                 },
                 Err(e) => error!("Failed to receive data: {}", e),
             }
@@ -209,8 +270,8 @@ mod tests {
         let client_task = task::spawn(async {
             let mut stream = TcpStream::connect("127.0.0.1:8082").await.expect("Failed to connect");
             let protocol = CustomProtocol::new(true);
-            let data = "Hello, secure peer-to-peer world!";
-            if let Err(e) = protocol.send_data(&mut stream, data.as_bytes()).await {
+            let data = PayloadData {payload_data_type: PayloadDataType::DATA, decrypted_data: "Hello, secure peer-to-peer world!".as_bytes().to_vec()};
+            if let Err(e) = protocol.send_data(&mut stream, &data).await {
                 error!("Failed to send data: {}", e);
             }
         });

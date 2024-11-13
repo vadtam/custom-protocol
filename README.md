@@ -10,3 +10,4 @@ $ cargo test
 - Latency Measurement and Analytics
 - Protocol Versioning and Compatibility Checks
 - Connection Handshake through Diffie-Hellman key exchange
+- Packet Acknowledgment and Retransmission
