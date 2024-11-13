@@ -8,12 +8,14 @@ use aes_gcm::{Aes256Gcm, Key, Nonce};
 use aes_gcm::aead::{Aead, Error as AeadError};
 use aes_gcm::KeyInit;
 use std::sync::Arc;
+use std::thread::JoinHandle;
 use serde::{Serialize, Deserialize};
 use rand::Rng;
 use thiserror::Error;
 use log::{error, info};
 use std::collections::VecDeque;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use tokio::time::{sleep, Instant};
 use std::sync::atomic::{AtomicU64, Ordering};
 use x25519_dalek::{EphemeralSecret, PublicKey as DhPublicKey};
 
@@ -42,6 +44,37 @@ impl LatencyTracker {
             None
         } else {
             Some(self.latencies.iter().copied().sum::<Duration>() / self.latencies.len() as u32)
+        }
+    }
+}
+
+struct CongestionControl {
+    send_interval: Duration,
+    min_rtt: Duration,
+    max_rtt: Duration,
+}
+
+impl CongestionControl {
+    fn new() -> Self {
+        Self {
+            send_interval: Duration::from_millis(50), // Start with an initial send interval
+            min_rtt: Duration::from_millis(50),
+            max_rtt: Duration::from_millis(1000),
+        }
+    }
+
+    // Adjust sending rate based on RTT using AIMD
+    fn adjust_rate(&mut self, measured_rtt: Duration, packet_loss: bool) {
+        if packet_loss {
+            // Multiplicative Decrease: On packet loss, increase send interval (decrease rate)
+            self.send_interval = (self.send_interval * 2).min(self.max_rtt);
+            info!("Packet loss detected, doubling send interval to {:?}", self.send_interval);
+        } else {
+            // Additive Increase: If RTT is low, decrease send interval (increase rate)
+            if measured_rtt < self.min_rtt {
+                self.send_interval = self.send_interval.checked_sub(Duration::from_millis(5)).unwrap_or(self.min_rtt);
+                info!("Reducing send interval to {:?}", self.send_interval);
+            }
         }
     }
 }
@@ -161,6 +194,7 @@ struct CustomProtocol {
     packet_id_counter: AtomicU64,
     unacknowledged_packets: Arc<Mutex<VecDeque<(u64, Vec<u8>, Instant)>>>, // Stores packet_id, data, and timestamp
     retransmit_unacknowledged: bool,
+    congestion_control: CongestionControl,
 }
 
 impl CustomProtocol {
@@ -176,6 +210,7 @@ impl CustomProtocol {
             packet_id_counter: AtomicU64::new(0),
             unacknowledged_packets: Arc::new(Mutex::new(VecDeque::new())),
             retransmit_unacknowledged: true,
+            congestion_control: CongestionControl::new(),
         }
     }
 
@@ -222,6 +257,8 @@ impl CustomProtocol {
             info!("Sending data without latency reduction.");
             stream.write_all(&serialized_payload).await
         };
+
+        sleep(self.congestion_control.send_interval).await;
 
         send_result.map_err(|e| CustomProtocolError::IoError {
             operation: "send data over TCP",
@@ -299,6 +336,9 @@ impl CustomProtocol {
                 info!("Retransmitting loop exited.");
                 return Ok(());
             }
+
+            // TODO: adjust congestion_control here
+            // TODO: spawn this loop as thread on object creation
         }
     }
 }

@@ -11,3 +11,4 @@ $ cargo test
 - Protocol Versioning and Compatibility Checks
 - Connection Handshake through Diffie-Hellman key exchange
 - Packet Acknowledgment and Retransmission
+- Adaptive Congestion Control
